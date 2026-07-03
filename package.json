@@ -1,0 +1,22 @@
+{
+  "name": "gofile-dl",
+  "version": "0.1.0",
+  "description": "Download every file from a Gofile folder using the public share page.",
+  "type": "module",
+  "bin": {
+    "gofile-dl": "./src/gofile-dl.mjs"
+  },
+  "scripts": {
+    "check": "node --check src/gofile-dl.mjs && node --check scripts/scrape_gofile.mjs",
+    "test": "node --test",
+    "build": "npm test && npm run check"
+  },
+  "dependencies": {
+    "proxy-agent": "^6.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "private": true
+}

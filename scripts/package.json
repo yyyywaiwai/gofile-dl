@@ -1,8 +1,0 @@
-{
-  "name": "gofile-dl-scripts",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "puppeteer-core": "^24.8.2"
-  }
-}
