@@ -6,10 +6,16 @@
   "bin": {
     "gofile-dl": "./src/gofile-dl.mjs"
   },
+  "files": [
+    "src",
+    "scripts/scrape_gofile.mjs"
+  ],
   "scripts": {
+    "gofile-dl": "node src/gofile-dl.mjs",
     "check": "node --check src/gofile-dl.mjs && node --check scripts/scrape_gofile.mjs",
     "test": "node --test",
-    "build": "npm test && npm run check"
+    "build": "npm test && npm run check",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "proxy-agent": "^6.5.0"
@@ -18,5 +24,17 @@
     "node": ">=20"
   },
   "license": "MIT",
-  "private": true
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yyyywaiwai/gofile-dl.git"
+  },
+  "homepage": "https://github.com/yyyywaiwai/gofile-dl#readme",
+  "bugs": {
+    "url": "https://github.com/yyyywaiwai/gofile-dl/issues"
+  },
+  "keywords": [
+    "gofile",
+    "download",
+    "cli"
+  ]
 }

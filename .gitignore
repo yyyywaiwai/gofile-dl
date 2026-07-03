@@ -1,5 +1,5 @@
 /target
-/gf-downloads/
 /node_modules/
 /scripts/node_modules/
 .DS_Store
+*.tgz

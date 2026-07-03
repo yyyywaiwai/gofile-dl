@@ -740,9 +740,17 @@ export async function runCli(argv = process.argv.slice(2)) {
   process.stdout.write("download complete\n");
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+function isCliEntrypoint() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const resolved = path.resolve(entry);
+  const self = fileURLToPath(import.meta.url);
+  if (resolved === self) return true;
+  const base = path.basename(resolved);
+  return base === "gofile-dl" || base === "gofile-dl.mjs" || base === "gofile-dl.cmd";
+}
 
-if (isMain) {
+if (isCliEntrypoint()) {
   runCli().catch((error) => {
     if (error instanceof UsageError) {
       process.stderr.write(`${error.message}\n\n${usage()}`);
