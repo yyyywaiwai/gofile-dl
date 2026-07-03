@@ -2,7 +2,6 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -11,26 +10,24 @@ use futures_util::{StreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{Client, header};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
-    time::{Duration, sleep},
+    process::Command,
+    time::Duration,
 };
 use url::Url;
 
-const API_SERVER: &str = "api";
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
-const BROWSER_LANGUAGE: &str = "en-US";
-const WEBSITE_TOKEN_SALT: &str = "9844d94d963d30";
-const PAGE_SIZE: usize = 1000;
-const SCRAPE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const SCRAPE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(0);
 
 #[derive(Debug, Parser)]
 #[command(
     author,
     version,
-    about = "Download every file from a Gofile folder by mimicking the Gofile web page"
+    about = "Download every file from a Gofile folder using the public share page (browser scrape)"
 )]
 struct Args {
     /// Gofile folder URL such as https://gofile.io/d/r3dUsW, or a raw content id.
@@ -43,10 +40,6 @@ struct Args {
     /// Folder password, if the Gofile link is password protected.
     #[arg(short, long)]
     password: Option<String>,
-
-    /// Reuse a Gofile web account token instead of creating a new guest session.
-    #[arg(long, env = "GOFILE_WEB_TOKEN")]
-    web_token: Option<String>,
 
     /// Number of simultaneous file downloads.
     #[arg(short = 'j', long, default_value_t = 4)]
@@ -63,18 +56,25 @@ struct Args {
     /// Suppress progress logs on stderr.
     #[arg(short, long)]
     quiet: bool,
+
+    /// HTTP(S) or SOCKS proxy for file downloads (also reads HTTPS_PROXY / ALL_PROXY).
+    #[arg(long, env = "GOFILE_PROXY")]
+    proxy: Option<String>,
+
+    /// Chrome/Chromium binary used for scraping (also reads CHROME_PATH).
+    #[arg(long, env = "CHROME_PATH")]
+    chrome_path: Option<PathBuf>,
+
+    /// Node script that loads the share page and calls the site getContent() API in-browser.
+    #[arg(long, env = "GOFILE_SCRAPE_SCRIPT")]
+    scrape_script: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebResponse<T> {
-    status: String,
+struct ScrapePayload {
     #[serde(default)]
-    data: Option<T>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct GuestAccount {
-    token: String,
+    token: Option<String>,
+    root: Content,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -110,29 +110,29 @@ struct DownloadItem {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let content_id = extract_content_id(&args.url_or_id)?;
+    let share_url = format!("https://gofile.io/d/{content_id}");
     let jobs = args.jobs.max(1);
 
-    let client = build_client()?;
+    let client = build_client(args.proxy.as_deref())?;
+    if let Some(proxy) = resolve_proxy_url(args.proxy.as_deref()) {
+        log_status(args.quiet, format_args!("using proxy {proxy} for downloads"));
+    }
+
     log_status(
         args.quiet,
-        format_args!("opening Gofile page for {content_id}"),
+        format_args!("scraping share page {share_url} in headless Chrome"),
     );
-    fetch_share_page(&client, &content_id, args.quiet).await?;
-    let session = WebSession::new(resolve_web_token(&client, args.web_token, args.quiet).await?);
-    log_status(
-        args.quiet,
-        format_args!("scraping root folder {content_id}"),
-    );
-    let root = fetch_folder_all_pages(
-        &client,
-        &session,
-        &content_id,
+    let payload = scrape_share_tree(
+        &share_url,
         args.password.as_deref(),
+        args.chrome_path.as_deref(),
+        args.scrape_script.as_deref(),
         args.quiet,
     )
     .await
-    .with_context(|| format!("failed to scrape Gofile content {content_id}"))?;
+    .with_context(|| format!("failed to scrape Gofile share page {share_url}"))?;
 
+    let root = payload.root;
     let root_name = root
         .name
         .as_deref()
@@ -140,15 +140,7 @@ async fn main() -> Result<()> {
         .map(sanitize_component)
         .unwrap_or_else(|| sanitize_component(&content_id));
 
-    let items = list_downloads(
-        &client,
-        &session,
-        root,
-        PathBuf::from(root_name),
-        args.password.as_deref(),
-        args.quiet,
-    )
-    .await?;
+    let items = list_downloads_from_content(root, PathBuf::from(root_name), args.quiet);
 
     if items.is_empty() {
         bail!("no downloadable files found in this Gofile content");
@@ -165,7 +157,6 @@ async fn main() -> Result<()> {
     );
 
     if args.dry_run {
-        log_status(args.quiet, format_args!("dry run: printing file list only"));
         for item in &items {
             println!("{}", item.relative_path.display());
         }
@@ -184,6 +175,7 @@ async fn main() -> Result<()> {
         ),
     );
 
+    let account_token = payload.token;
     let multi = Arc::new(MultiProgress::new());
     let style = ProgressStyle::with_template(
         "{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {eta}",
@@ -195,7 +187,7 @@ async fn main() -> Result<()> {
         .map(|item| {
             let client = client.clone();
             let output = args.output.clone();
-            let session = session.clone();
+            let token = account_token.clone();
             let multi = Arc::clone(&multi);
             let style = style.clone();
             async move {
@@ -203,7 +195,7 @@ async fn main() -> Result<()> {
                     &client,
                     &item,
                     &output,
-                    &session,
+                    token.as_deref(),
                     args.overwrite,
                     &multi,
                     style,
@@ -228,7 +220,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_client() -> Result<Client> {
+fn resolve_proxy_url(cli_proxy: Option<&str>) -> Option<String> {
+    cli_proxy
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+                .into_iter()
+                .find_map(|key| std::env::var(key).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn build_client(cli_proxy: Option<&str>) -> Result<Client> {
     let mut headers = header::HeaderMap::new();
     headers.insert(
         header::USER_AGENT,
@@ -239,371 +245,171 @@ fn build_client() -> Result<Client> {
         header::HeaderValue::from_static("https://gofile.io/"),
     );
 
-    Client::builder()
+    let mut builder = Client::builder()
         .default_headers(headers)
+        .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .context("failed to build HTTP client")
-}
+        .tcp_keepalive(Duration::from_secs(60))
+        .http1_only();
 
-#[derive(Clone, Debug)]
-struct WebSession {
-    token: String,
-}
-
-impl WebSession {
-    fn new(token: String) -> Self {
-        Self { token }
-    }
-
-    fn website_token(&self) -> String {
-        generate_website_token(&self.token, current_wt_period())
-    }
-}
-
-async fn fetch_share_page(client: &Client, content_id: &str, quiet: bool) -> Result<()> {
-    for attempt in 0..3 {
-        log_status(
-            quiet,
-            format_args!(
-                "fetching https://gofile.io/d/{content_id}, attempt {}",
-                attempt + 1
-            ),
+    if let Some(proxy_url) = resolve_proxy_url(cli_proxy) {
+        builder = builder.proxy(
+            reqwest::Proxy::all(&proxy_url)
+                .with_context(|| format!("invalid proxy URL {proxy_url}"))?,
         );
-
-        let result = client
-            .get(format!("https://gofile.io/d/{content_id}"))
-            .timeout(SCRAPE_REQUEST_TIMEOUT)
-            .send()
-            .await
-            .and_then(|response| response.error_for_status());
-
-        match result {
-            Ok(_) => {
-                log_status(quiet, format_args!("page opened"));
-                return Ok(());
-            }
-            Err(err) if attempt < 2 => {
-                let wait = Duration::from_secs(2u64.pow(attempt + 1));
-                log_status(
-                    quiet,
-                    format_args!("page fetch failed: {err}; retrying in {}s", wait.as_secs()),
-                );
-                sleep(wait).await;
-            }
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to fetch https://gofile.io/d/{content_id}"));
-            }
-        }
     }
 
-    unreachable!("fetch_share_page retry loop always returns")
+    builder.build().context("failed to build HTTP client")
 }
 
-async fn create_guest_account(client: &Client, quiet: bool) -> Result<GuestAccount> {
-    let mut last_status = None;
-
-    for attempt in 0..5 {
-        log_status(
-            quiet,
-            format_args!(
-                "creating temporary Gofile web session, attempt {}",
-                attempt + 1
-            ),
-        );
-        let response = client
-            .post(format!("https://{API_SERVER}.gofile.io/accounts"))
-            .timeout(SCRAPE_REQUEST_TIMEOUT)
-            .send()
-            .await?;
-
-        if response.status().as_u16() == 429 {
-            last_status = Some("http-429".to_string());
-            let wait = Duration::from_secs(2u64.pow(attempt + 1));
-            log_status(
-                quiet,
-                format_args!(
-                    "rate limited while creating session; waiting {}s",
-                    wait.as_secs()
-                ),
-            );
-            sleep(wait).await;
-            continue;
-        }
-
-        let response = response.error_for_status()?;
-        let body = response.json::<WebResponse<GuestAccount>>().await?;
-        if body.status == "error-rateLimit" {
-            last_status = Some(body.status);
-            let wait = Duration::from_secs(2u64.pow(attempt + 1));
-            log_status(
-                quiet,
-                format_args!(
-                    "rate limited while creating session; waiting {}s",
-                    wait.as_secs()
-                ),
-            );
-            sleep(wait).await;
-            continue;
-        }
-
-        if body.status != "ok" {
-            bail!(
-                "Gofile web account creation returned status '{}'",
-                body.status
-            );
-        }
-
-        log_status(quiet, format_args!("temporary web session ready"));
-        return body
-            .data
-            .ok_or_else(|| anyhow!("Gofile web account creation returned no data"));
-    }
-
-    bail!(
-        "Gofile rate limit while creating a web guest account; last status: {}",
-        last_status.unwrap_or_else(|| "unknown".to_string())
-    )
+fn default_scrape_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/scrape_gofile.mjs")
 }
 
-async fn resolve_web_token(
-    client: &Client,
-    explicit_token: Option<String>,
-    quiet: bool,
-) -> Result<String> {
-    if let Some(token) = explicit_token.filter(|token| !token.trim().is_empty()) {
-        log_status(quiet, format_args!("using provided Gofile web token"));
-        return Ok(token);
-    }
-
-    let cache_path = web_token_cache_path();
-    if let Some(path) = &cache_path {
-        if let Ok(token) = fs::read_to_string(path).await {
-            let token = token.trim();
-            if !token.is_empty() {
-                log_status(
-                    quiet,
-                    format_args!("using cached Gofile web token from {}", path.display()),
-                );
-                return Ok(token.to_string());
-            }
-        }
-    }
-
-    let account = create_guest_account(client, quiet).await?;
-    if let Some(path) = &cache_path {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent).await;
-        }
-        if fs::write(path, &account.token).await.is_ok() {
-            log_status(
-                quiet,
-                format_args!("cached Gofile web token at {}", path.display()),
-            );
-        }
-    }
-    Ok(account.token)
-}
-
-fn web_token_cache_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".cache").join("gofile-dl").join("web-token"))
-}
-
-async fn fetch_folder_all_pages(
-    client: &Client,
-    session: &WebSession,
-    content_id: &str,
+async fn scrape_share_tree(
+    share_url: &str,
     password: Option<&str>,
+    chrome_path: Option<&Path>,
+    scrape_script: Option<&Path>,
     quiet: bool,
-) -> Result<Content> {
-    let mut merged: Option<Content> = None;
-    let mut page = 1usize;
-
-    loop {
-        let page_content =
-            fetch_content_page(client, session, content_id, password, page, quiet).await?;
-        let child_count = page_content.children.len();
-        log_status(
-            quiet,
-            format_args!("folder {content_id} page {page}: {child_count} item(s)"),
+) -> Result<ScrapePayload> {
+    let script = scrape_script
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_scrape_script);
+    if !script.is_file() {
+        bail!(
+            "scrape script not found at {}; run npm install in {}",
+            script.display(),
+            script.parent().unwrap_or(Path::new(".")).display()
         );
-
-        if let Some(existing) = &mut merged {
-            existing.children.extend(page_content.children);
-        } else {
-            merged = Some(page_content);
-        }
-
-        if child_count < PAGE_SIZE {
-            break;
-        }
-        page += 1;
     }
 
-    merged.ok_or_else(|| anyhow!("Gofile returned no content pages"))
+    ensure_scrape_dependencies(script.parent().unwrap()).await?;
+
+    let node = which_node()?;
+    let mut command = Command::new(node);
+    command.arg(&script).arg(share_url);
+    if let Some(password) = password.filter(|value| !value.is_empty()) {
+        command.arg(password);
+    }
+    if let Some(chrome) = chrome_path {
+        command.env("CHROME_PATH", chrome);
+    }
+
+    log_status(quiet, format_args!("running {}", script.display()));
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("failed to run scrape script {}", script.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "share page scrape failed (exit {})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("scrape script stdout is not utf-8")?;
+    let payload: ScrapePayload =
+        serde_json::from_str(stdout.trim()).context("failed to parse scrape script JSON")?;
+    Ok(payload)
 }
 
-async fn fetch_content_page(
-    client: &Client,
-    session: &WebSession,
-    content_id: &str,
-    password: Option<&str>,
-    page: usize,
-    quiet: bool,
-) -> Result<Content> {
-    let mut last_status = None;
+async fn ensure_scrape_dependencies(script_dir: &Path) -> Result<()> {
+    let node_modules = script_dir.join("node_modules/puppeteer-core");
+    if node_modules.is_dir() {
+        return Ok(());
+    }
 
-    for attempt in 0..4 {
-        log_status(
-            quiet,
-            format_args!(
-                "fetching folder {content_id} page {page}, attempt {}",
-                attempt + 1
-            ),
+    let npm = which_npm()?;
+    let status = Command::new(npm)
+        .arg("install")
+        .current_dir(script_dir)
+        .status()
+        .await
+        .with_context(|| format!("failed to run npm install in {}", script_dir.display()))?;
+    if !status.success() {
+        bail!(
+            "npm install failed in {}; install puppeteer-core manually",
+            script_dir.display()
         );
-        let mut request = client
-            .get(format!(
-                "https://{API_SERVER}.gofile.io/contents/{content_id}"
-            ))
-            .query(&[
-                ("contentFilter", ""),
-                ("page", &page.to_string()),
-                ("pageSize", &PAGE_SIZE.to_string()),
-                ("sortField", "name"),
-                ("sortDirection", "1"),
-            ])
-            .bearer_auth(&session.token)
-            .header("X-Website-Token", session.website_token())
-            .header("X-BL", BROWSER_LANGUAGE)
-            .header(header::COOKIE, format!("accountToken={}", session.token))
-            .timeout(SCRAPE_REQUEST_TIMEOUT);
+    }
+    Ok(())
+}
 
-        if let Some(password) = password.filter(|value| !value.is_empty()) {
-            request = request.query(&[("password", password)]);
-        }
-
-        let response = request.send().await?;
-        if response.status().as_u16() == 429 {
-            last_status = Some("http-429".to_string());
-            let wait = Duration::from_secs(2u64.pow(attempt + 1));
-            log_status(
-                quiet,
-                format_args!(
-                    "rate limited on folder {content_id} page {page}; waiting {}s",
-                    wait.as_secs()
-                ),
-            );
-            sleep(wait).await;
-            continue;
-        }
-
-        let response = response.error_for_status()?;
-        let body = response.json::<WebResponse<Content>>().await?;
-        if body.status == "error-rateLimit" {
-            last_status = Some(body.status);
-            let wait = Duration::from_secs(2u64.pow(attempt + 1));
-            log_status(
-                quiet,
-                format_args!(
-                    "rate limited on folder {content_id} page {page}; waiting {}s",
-                    wait.as_secs()
-                ),
-            );
-            sleep(wait).await;
-            continue;
-        }
-
-        if body.status != "ok" && body.status != "error-notFound" {
-            bail!("Gofile web endpoint returned status '{}'", body.status);
-        }
-
-        let content = body
-            .data
-            .ok_or_else(|| anyhow!("Gofile web endpoint returned no content data"))?;
-        if content.can_access == Some(false) {
-            if content.password_status.as_deref() == Some("passwordRequired")
-                || content.password_status.as_deref() == Some("passwordWrong")
-            {
-                bail!("this Gofile folder needs a valid --password");
+fn which_node() -> Result<String> {
+    std::env::var("NODE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            for candidate in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
+                if Path::new(candidate).is_file() {
+                    return Some(candidate.to_string());
+                }
             }
-            bail!("this Gofile content is not publicly accessible");
-        }
-
-        return Ok(content);
-    }
-
-    bail!(
-        "Gofile rate limit while scraping content {} page {}; last status: {}",
-        content_id,
-        page,
-        last_status.unwrap_or_else(|| "unknown".to_string())
-    )
+            None
+        })
+        .ok_or_else(|| anyhow!("node not found; install Node.js or set NODE"))
 }
 
-async fn list_downloads(
-    client: &Client,
-    session: &WebSession,
+fn which_npm() -> Result<String> {
+    std::env::var("NPM")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            for candidate in ["/opt/homebrew/bin/npm", "/usr/local/bin/npm", "/usr/bin/npm"] {
+                if Path::new(candidate).is_file() {
+                    return Some(candidate.to_string());
+                }
+            }
+            None
+        })
+        .ok_or_else(|| anyhow!("npm not found; install Node.js or set NPM"))
+}
+
+fn list_downloads_from_content(
     root: Content,
     root_path: PathBuf,
-    password: Option<&str>,
     quiet: bool,
-) -> Result<Vec<DownloadItem>> {
+) -> Vec<DownloadItem> {
     let mut items = Vec::new();
-    let mut stack = vec![(root, root_path)];
+    collect_downloads(&root, root_path, &mut items, quiet);
+    items
+}
 
-    while let Some((content, path)) = stack.pop() {
-        if content.kind.as_deref() == Some("file") {
-            if let Some(url) = content.link {
-                log_status(quiet, format_args!("queued file {}", path.display()));
+fn collect_downloads(content: &Content, base: PathBuf, items: &mut Vec<DownloadItem>, quiet: bool) {
+    match content.kind.as_deref() {
+        Some("file") => {
+            if let Some(url) = &content.link {
+                log_status(quiet, format_args!("queued file {}", base.display()));
                 items.push(DownloadItem {
-                    url,
-                    relative_path: path,
+                    url: url.clone(),
+                    relative_path: base,
                     size: content.size,
                 });
             }
-            continue;
         }
-
-        for (fallback_id, child) in content.children {
-            let name = child
-                .name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .map(sanitize_component)
-                .unwrap_or_else(|| sanitize_component(&fallback_id));
-            let child_path = path.join(name);
-
-            if child.kind.as_deref() == Some("folder") {
-                let child_id = child
-                    .id
+        _ => {
+            for (id, child) in &content.children {
+                let name = child
+                    .name
                     .as_deref()
-                    .or(child.code.as_deref())
-                    .unwrap_or(&fallback_id)
-                    .to_string();
-                log_status(
-                    quiet,
-                    format_args!("entering folder {} ({child_id})", child_path.display()),
-                );
-                let full_child =
-                    fetch_folder_all_pages(client, session, &child_id, password, quiet).await?;
-                stack.push((full_child, child_path));
-            } else {
-                stack.push((child, child_path));
+                    .filter(|name| !name.trim().is_empty())
+                    .map(sanitize_component)
+                    .unwrap_or_else(|| sanitize_component(id));
+                collect_downloads(child, base.join(name), items, quiet);
             }
         }
     }
-
-    Ok(items)
 }
 
 async fn download_one(
     client: &Client,
     item: &DownloadItem,
     output_root: &Path,
-    session: &WebSession,
+    account_token: Option<&str>,
     overwrite: bool,
     multi: &MultiProgress,
     style: ProgressStyle,
@@ -623,9 +429,13 @@ async fn download_one(
     progress.set_style(style);
     progress.set_message(item.relative_path.display().to_string());
 
-    let request = client
-        .get(&item.url)
-        .header(header::COOKIE, format!("accountToken={}", session.token));
+    let mut request = client.get(&item.url);
+    if let Some(token) = account_token.filter(|value| !value.is_empty()) {
+        request = request.header(header::COOKIE, format!("accountToken={token}"));
+    }
+    if DOWNLOAD_REQUEST_TIMEOUT.as_secs() > 0 {
+        request = request.timeout(DOWNLOAD_REQUEST_TIMEOUT);
+    }
 
     let response = request.send().await?.error_for_status()?;
     if progress.length().unwrap_or(0) == 0 {
@@ -660,32 +470,6 @@ async fn download_one(
     Ok(())
 }
 
-#[cfg(test)]
-fn collect_downloads(content: &Content, base: PathBuf, items: &mut Vec<DownloadItem>) {
-    match content.kind.as_deref() {
-        Some("file") => {
-            if let Some(url) = &content.link {
-                items.push(DownloadItem {
-                    url: url.clone(),
-                    relative_path: base,
-                    size: content.size,
-                });
-            }
-        }
-        _ => {
-            for (id, child) in &content.children {
-                let name = child
-                    .name
-                    .as_deref()
-                    .filter(|name| !name.trim().is_empty())
-                    .map(sanitize_component)
-                    .unwrap_or_else(|| sanitize_component(id));
-                collect_downloads(child, base.join(name), items);
-            }
-        }
-    }
-}
-
 fn extract_content_id(input: &str) -> Result<String> {
     if let Ok(url) = Url::parse(input) {
         let mut segments = url
@@ -710,20 +494,6 @@ fn extract_content_id(input: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn generate_website_token(account_token: &str, period: u64) -> String {
-    sha256_hex(&format!(
-        "{USER_AGENT}::{BROWSER_LANGUAGE}::{account_token}::{period}::{WEBSITE_TOKEN_SALT}"
-    ))
-}
-
-fn current_wt_period() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        / 14_400
-}
-
 fn sanitize_component(name: &str) -> String {
     let sanitized = name
         .chars()
@@ -742,12 +512,6 @@ fn sanitize_component(name: &str) -> String {
     } else {
         sanitized
     }
-}
-
-fn sha256_hex(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 fn log_status(quiet: bool, args: std::fmt::Arguments<'_>) {
@@ -797,14 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn generates_browser_website_token() {
-        assert_eq!(
-            generate_website_token("UhjT8mfpQCuFaTt1PQJIsQ2D5i5O2tlW", 123823),
-            "44c2bfadf3c7252b29e49f327fbb5605a6c0f14aab0578ce958db924fbd2c3cd"
-        );
-    }
-
-    #[test]
     fn flattens_nested_content_tree() {
         let json = r#"{
             "name": "root",
@@ -826,8 +582,7 @@ mod tests {
         }"#;
 
         let content: Content = serde_json::from_str(json).unwrap();
-        let mut items = Vec::new();
-        collect_downloads(&content, PathBuf::from("root"), &mut items);
+        let items = list_downloads_from_content(content, PathBuf::from("root"), true);
 
         assert_eq!(items.len(), 1);
         assert_eq!(
