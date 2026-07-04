@@ -14,6 +14,7 @@ import {
   generateWebsiteToken,
   hashGofilePassword,
   listDownloadsFromContent,
+  normalizeProxyUrl,
   parseArgs,
   renderProgressLine,
   sanitizeComponent,
@@ -108,6 +109,13 @@ test("parses CLI flags", () => {
   assert.equal(args.dryRun, true);
   assert.equal(args.quiet, true);
   assert.equal(args.urlOrId, "https://gofile.io/d/r3dUsW");
+});
+
+test("normalizes proxy host and port shorthand", () => {
+  assert.equal(normalizeProxyUrl("103.159.96.195:8080"), "http://103.159.96.195:8080");
+  assert.equal(normalizeProxyUrl(" http://127.0.0.1:7890 "), "http://127.0.0.1:7890");
+  assert.equal(normalizeProxyUrl("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080");
+  assert.equal(normalizeProxyUrl(""), null);
 });
 
 test("runs dry-run CLI with external scraper JSON", () => {

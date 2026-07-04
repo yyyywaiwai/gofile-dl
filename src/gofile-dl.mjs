@@ -355,13 +355,20 @@ Environment:
 `;
 }
 
+export function normalizeProxyUrl(value) {
+  const proxy = String(value ?? "").trim();
+  if (!proxy) return null;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(proxy)) return proxy;
+  return `http://${proxy}`;
+}
+
 function resolveProxyUrl(cliProxy) {
   const explicit = String(cliProxy ?? "").trim();
-  if (explicit) return explicit;
+  if (explicit) return normalizeProxyUrl(explicit);
 
   for (const key of ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {
     const value = String(process.env[key] ?? "").trim();
-    if (value) return value;
+    if (value) return normalizeProxyUrl(value);
   }
   return null;
 }
